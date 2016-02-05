@@ -1,0 +1,55 @@
+$CFG = {
+rrd_datasources => {
+	input_octets	=> 'i:COUNTER:0:U',
+	output_octets	=> 'o:COUNTER:0:U',
+	input_unicast_packets	=> 'ipu:COUNTER:0:U',
+	input_multicast_packets	=> 'ipm:COUNTER:0:U',
+	input_broadcast_packets	=> 'ipb:COUNTER:0:U',
+	output_unicast_packets	 => 'opu:COUNTER:0:U',
+	output_multicast_packets => 'opm:COUNTER:0:U',
+	output_broadcast_packets => 'opb:COUNTER:0:U'
+},
+
+rrd_archives => {
+	average_1min_for_24h	=> 'RRA:AVERAGE:0.5:1:1440',	# Store 1min average for 1 day with calls every 60 seconds (1 PDP, 24*60 rows)
+	average_5min_for_2d	=> 'RRA:AVERAGE:0.5:5:576',	# Store 5min average for 2 days with calls every 60 seconds (5 minutes = 5 PDPs, 48*60 / 5 = 576 rows)
+	average_30m_for_2w	=> 'RRA:AVERAGE:0.5:30:672',	# Store 30min average for 2 weeks with calls every 60 seconds (30minutes = 30 PDPs, 14*24*60 / 30 = 672 rows)
+	average_2h_for_2m	=> 'RRA:AVERAGE:0.5:120:744',	# Store 2h average for 2 monthes with calls every 60 seconds (2h = 120 PDPs, 2m * 31d * 24h * 60m / 120 = 744 rows)
+	average_1d_for_2y	=> 'RRA:AVERAGE:0.5:1440:732'	# Store 1d average for 2 years with calls every 60 seconds (1d = 24*60 = 1440 PDPs, 1y = 366 days, 2*366*24*60 / 1440 = 732 rows )
+},
+
+paths => {
+	rrd => '/data/noc/grapher/rrd'
+},
+
+templates => {
+	router_iface_stats => {
+		period	=> 60,
+                rrd_datasources => {
+                        input_octets            => 'snmp2c://public@myrouter:161/ifHCInOctets?ifName=%%IFNAME%%',
+                        output_octets           => 'snmp2c://public@myrouter:161/ifHCOutOctets?ifName=%%IFNAME%%',
+                        input_unicast_packets   => 'snmp2c://public@myrouter:161/ifHCInUcastPkts?ifName=%%IFNAME%%',
+                        input_multicast_packets => 'snmp2c://public@myrouter:161/ifHCInMulticastPkts?ifName=%%IFNAME%%',
+                        input_broadcast_packets => 'snmp2c://public@myrouter:161/ifHCInBroadcastPkts?ifName=%%IFNAME%%',
+                        output_unicast_packets  => 'snmp2c://public@myrouter:161/ifHCOutUcastPkts?ifName=%%IFNAME%%',
+                        output_multicast_packets=> 'snmp2c://public@myrouter:161/ifHCOutMulticastPkts?ifName=%%IFNAME%%',
+                        output_broadcast_packets=> 'snmp2c://public@myrouter:161/ifHCOutBroadcastPkts?ifName=%%IFNAME%%',
+                },
+                rrd_archives => [
+			'RRA:AVERAGE:0.5:1:1440',    # Store 1min average for 1 day with calls every 60 seconds (1 PDP, 24*60 rows)
+			'RRA:AVERAGE:0.5:5:576',     # Store 5min average for 2 days with calls every 60 seconds (5 minutes = 5 PDPs, 48*60 / 5 = 576 rows)
+			'RRA:AVERAGE:0.5:30:672',    # Store 30min average for 2 weeks with calls every 60 seconds (30minutes = 30 PDPs, 14*24*60 / 30 = 672 rows)
+			'RRA:AVERAGE:0.5:120:744',   # Store 2h average for 2 monthes with calls every 60 seconds (2h = 120 PDPs, 2m * 31d * 24h * 60m / 120 = 744 rows)
+			'RRA:AVERAGE:0.5:1440:732'   # Store 1d average for 2 years with calls every 60 seconds (1d = 24*60 = 1440 PDPs, 1y = 366 days, 2*366*24*60 / 1440 = 732 rows )
+		]
+	}
+},
+
+files => {
+	'myrouter/ethernet1-1.rrd' => { template => router_iface_stats, var => { IFNAME => 'ethernet1/1' } },
+}
+
+
+
+} # END ODF CFG
+
