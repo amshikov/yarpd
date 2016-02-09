@@ -2,7 +2,7 @@
 
 no warnings 'experimental';
 use strict;
-use vars qw/$CFG $CFGMON/;
+use vars qw/$CF $CFG $CFGMON/;
 use Sys::Syslog qw(:standard :macros);
 use URI;
 use SNMP;
@@ -16,10 +16,12 @@ use File::Monitor;
 
 $|=1;
 
+$CF = './yarpd.conf';
+
 #
 # Configure File
 #
-Prepare_Config("./yarpd.conf");
+Prepare_Config($CF);
 
 #
 # TODO: Daemonization
@@ -29,7 +31,7 @@ Prepare_Config("./yarpd.conf");
 # Create configuration file monitor
 #
 my $CFGMON = File::Monitor->new();
-$CFGMON->watch('./yarpd.conf');
+$CFGMON->watch($CF);
 $CFGMON->scan();
 
 #
@@ -42,14 +44,13 @@ MAIN();
 # Function reads configuration file and properly updates $CFG hashref
 #
 sub Prepare_Config {
+	my $cf = shift;
 	printf "* Entering %s...\n", (caller 0)[3];
 	#
 	# Include config
 	#
 	$CFG = undef if defined $CFG;
-	print "BEFORE LOADING:\n", Dumper $CFG;
-	do "./yarpd.conf";
-	print "AFTER LOADING:\n", Dumper $CFG;
+	do "$cf";
 	#
 	# Update SNMP session data and indexes
 	#
@@ -105,8 +106,9 @@ sub _CFG_Update_SNMP {
 						DestHost	=> $2 . ':' . $h->{snmp}->{port},
 						Version		=> 2,
 						Community	=> $1,
-						BestGuess	=> 2,		# This is needed to translation MIB Var -> OID
-						UseNumeric	=> 1		# Return OIDs in numeric form			
+						UseNumeric      => 0,
+						UseLongNames	=> 0,
+						BestGuess	=> 2		# This is needed to translation MIB Var -> OID
 			      );
 			   }
 			} else {
@@ -137,7 +139,7 @@ sub _CFG_Update_SNMP {
 
 			if ($rrd_ds_def =~ /^(\w+):(COUNTER|GAUGE):(\-?\d+):([\dU])$/) {
 				$ds->{$1}->{host} = $h->{snmp}->{hostname};
-				$ds->{$1}->{oid}  = _oid($mib_var);
+				$ds->{$1}->{oid}  = $mib_var;
 				$ds->{$1}->{type} = $2;
 				$ds->{$1}->{min}  = $3;
 				$ds->{$1}->{max}  = $4;
@@ -183,7 +185,7 @@ sub _CFG_Update_RRD {
 				printf "   * ERROR: %s\n", $err;
 			}
 			my $RRD = merge \@DS, $file->{rrd_archives};
-			print Dumper $RRD;
+#			print Dumper $RRD;
 		}
 
 		#
@@ -207,12 +209,12 @@ sub SNMP_update_keys {
 	my $s 	= $h->{session}; 
 
 	# Convert $key from MIB variable to OID
-	my $oid	= _oid($key);
+	my $oid	= $key;
 	my $varlist = SNMP::VarList->new([ $oid ]);
 	# Get the table of all keys-value
 	my $resp = ($s->bulkwalk(0, 8, $varlist))[0];
 	map { 
-#		printf "%sSetting %s:%s to %s\n", ' 'x2, $key, $_->val, $_->iid;
+		printf "%sSetting %s:%s to %s (Type: %s)\n", ' 'x2, $key, $_->val, $_->iid, $_->type;
 		$h->{keys}->{$key}->{$_->val} = $_->iid;
 	} @$resp;
 }
@@ -225,7 +227,7 @@ sub MAIN {
 		#
 		if ($CFGMON->scan()) {
 			print "! Configuration file change detected. Reloading...\n";
-			Prepare_Config("./yarpd.conf");
+			Prepare_Config($CF);
 		}
 		foreach my $h (keys %{$CFG->{hosts}}) {
 			my $host = $CFG->{hosts}->{$h};
