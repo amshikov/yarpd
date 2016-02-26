@@ -13,6 +13,7 @@ use Data::Rmap;
 use Storable qw(dclone);
 use RRDs;
 use File::Monitor;
+use List::Compare;
 
 $|=1;
 
@@ -170,7 +171,16 @@ sub _CFG_Update_RRD {
 		$file->{apath} = $fn;	# Store absolute path for the future
 
 		if (-f $fn) {
-			# TODO: Update file data if needed
+			my $ri = RRDs::info $fn;
+			map { 
+			   $ri->{ds}->{$1}->{$2} = $ri->{$_} if $_ =~ /^ds\[([\w\d]+)\]\.(type|min|max|.minimal_heartbeat)$/;
+			} keys %$ri;
+
+			# Compare datasources from configuration with ones from file
+			my $rc = List::Compare->new([keys $ri->{ds}], [keys $file->{rrd_datasources}]);
+
+			# Add new datasources to file if they appear in configuration
+			_rrd_add_ds($file, $rc->get_Ronly_ref);
 		} else {
 			my @DS;
 			push @DS, '--step', $file->{period};
@@ -294,6 +304,26 @@ sub RRD_update {
 				printf "%s! ERROR: %s\n", ' 'x4, $err;
 			}
 		}
+	}
+}
+
+sub _rrd_add_ds {
+	my $file   = shift;	# reference to file hash from configuration
+	my $new_ds = shift;	# reference to list of datasource names to be added
+
+	return unless scalar @$new_ds;
+
+	printf "%s- Adding new datasources (%s) to file %s...\n", ' 'x2, join (', ', @$new_ds), $file->{apath};
+
+	my @DS;
+	foreach my $ds_name (@$new_ds) {
+		my $ds = $file->{rrd_datasources}->{$ds_name};
+		push @DS, sprintf("DS:%s:%s:%s:%s:%s", $ds_name, $ds->{type}, 2*$file->{period}, $ds->{min}, $ds->{max} );
+        }
+	RRDs::tune($file->{apath}, @DS);
+	my $err = RRDs::error;
+	if ($err) {
+		printf "%s! ERROR: %s\n", ' 'x4, $err;
 	}
 }
 
