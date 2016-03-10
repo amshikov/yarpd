@@ -14,6 +14,7 @@ use Storable qw(dclone);
 use RRDs;
 use File::Monitor;
 use List::Compare;
+use DateTime;
 
 $|=1;
 
@@ -51,7 +52,7 @@ sub Prepare_Config {
 	# Include config
 	#
 	$CFG = undef if defined $CFG;
-	do "$cf";
+	do "$cf" or die $!;
 	#
 	# Update SNMP session data and indexes
 	#
@@ -195,15 +196,17 @@ sub _CFG_Update_RRD {
 				printf "   * ERROR: %s\n", $err;
 			}
 			my $RRD = merge \@DS, $file->{rrd_archives};
-#			print Dumper $RRD;
 		}
 
 		#
 		# Form a hash for SNMP requests:
-		# host->{oid}->{file to save}->{ds}
+		# host->{oids}->{oid}->{file} = file to save in
+		# host->{oids}->{oid}->{ds} = data source to use
+		# host->{oids}->{oid}->{period} = period
                 while (my ($d, $ds) = each $file->{rrd_datasources}) {
-                        $hosts->{$ds->{host}}->{oids}->{$ds->{oid}}->{file} = $f;
-                        $hosts->{$ds->{host}}->{oids}->{$ds->{oid}}->{ds}   = $d;
+			$hosts->{$ds->{host}}->{oids}->{$ds->{oid}}->{file} = $f;
+			$hosts->{$ds->{host}}->{oids}->{$ds->{oid}}->{ds}   = $d;
+			$hosts->{$ds->{host}}->{oids}->{$ds->{oid}}->{period} = $file->{period};
                 }
 	}
 }
@@ -242,10 +245,24 @@ sub MAIN {
 		foreach my $h (keys %{$CFG->{hosts}}) {
 			my $host = $CFG->{hosts}->{$h};
 			#
-			# Send 64 OIDs per one request. It should be enough for most devices
+			# Select only those OIDs which should be updated
 			#
-			my @oids = keys %{$host->{oids}};
+			my @oids;
+			foreach my $o (keys $host->{oids}) {
+				my $oid = $host->{oids}->{$o};
+				if (defined $oid->{next_update}) {
+					if ( DateTime->compare($oid->{next_update}, DateTime->now()) <= 0 ) {
+	                                        $host->{oids}->{$o}->{next_update}->add(seconds => $oid->{period});
+	                                        push @oids, $o;	
+					}
+				} else {
+					$oid->{next_update} = DateTime->now()->add(seconds => $oid->{period});
+					push @oids, $o;
+				}
+			}
+
 			while (@oids) {
+				# Send 64 OIDs per one request. It should be enough for most devices
 				my $varlist = SNMP::VarList->new(map { [ $_ ] } splice @oids,0,64);
 				printf "* Sending SNMP request to %s...\n", $h;
 				my @res = $host->{session}->get($varlist);
@@ -261,11 +278,10 @@ sub MAIN {
 					my $ds_name = $host->{oids}->{$v->tag . '.' . $v->iid}->{ds};
 					$CFG->{files}->{$file_name}->{rrd_datasources}->{$ds_name}->{value} = $v->val;
 				}
-			
 			}
 		}
 		RRD_update();
-		sleep 60;
+		sleep 5;
 	}
 }
 
@@ -303,6 +319,8 @@ sub RRD_update {
 			if ($err) {
 				printf "%s! ERROR: %s\n", ' 'x4, $err;
 			}
+		} else {
+			printf "%s! No data for updating.\n", ' 'x4;
 		}
 	}
 }
