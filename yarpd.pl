@@ -139,13 +139,12 @@ sub _CFG_Update_SNMP {
 
 			my $ds = $file->{rrd_datasources};
 
-			if ($rrd_ds_def =~ /^(\w+):(COUNTER|GAUGE):(\-?\d+):([\dU])$/) {
+			if ($rrd_ds_def =~ /^(\w+):(COUNTER|GAUGE):(\-?\d+):(\-?(\d+|U))$/) {
 				$ds->{$1}->{host} = $h->{snmp}->{hostname};
 				$ds->{$1}->{oid}  = $mib_var;
 				$ds->{$1}->{type} = $2;
 				$ds->{$1}->{min}  = $3;
 				$ds->{$1}->{max}  = $4;
-#				printf "%s%s:%s will be gathered from %s OID %s\n", ' 'x2, $f, $1, $h->{snmp}->{hostname}, $ds->{$1}->{oid};
 			} else {
 				printf "  ! ERROR: RRD Data Source definition %s is not supported!\n", $rrd_ds_def;
 				next;
