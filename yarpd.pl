@@ -84,7 +84,16 @@ sub _CFG_Update_SNMP {
 		# Parse sources of data in files definition
 		#
 		foreach my $d (keys %{$file->{rrd_datasources}}) {
-			my $url_string = $file->{rrd_datasources}->{$d};
+			# Datasource definition if file can be either scalar ot hash reference. The second option is intended for converting values returned by SNMP
+			my $url_string;
+			my $converter;
+			if ( ref($file->{rrd_datasources}->{$d}) eq 'HASH' ) {
+				$url_string = $file->{rrd_datasources}->{$d}->{url};
+				$converter  = $file->{rrd_datasources}->{$d}->{convert};
+			} else {
+				$url_string = $file->{rrd_datasources}->{$d};
+			}
+
 			# Create new URI object
 			my $url = URI->new($url_string);
 
@@ -145,6 +154,7 @@ sub _CFG_Update_SNMP {
 				$ds->{$1}->{type} = $2;
 				$ds->{$1}->{min}  = $3;
 				$ds->{$1}->{max}  = $4;
+				$ds->{$1}->{convert} = $converter;
 			} else {
 				printf "  ! ERROR: RRD Data Source definition %s is not supported!\n", $rrd_ds_def;
 				next;
@@ -295,6 +305,14 @@ sub RRD_update {
 		my @VAL;
 		while ( my ($d, $ds) = each $file->{rrd_datasources}) {
 			if (defined $ds->{value}) {
+				if (defined $ds->{convert}) {
+					printf "%s- Converting %s using %s...\n", ' 'x4, $ds->{value}, $ds->{convert};
+					if ( ref($CFG->{converters}->{$ds->{convert}}) eq 'CODE' ) {
+						$ds->{value} = &{$CFG->{converters}->{$ds->{convert}}}($ds->{value});
+					} else {
+						printf "%s! ERROR: Converter %s is not CODE reference!\n", ' 'x6, $ds->{convert}
+					}
+				}
 				push @DS, $d;
 				push @VAL, $ds->{value};
 			} 
