@@ -257,15 +257,16 @@ sub MAIN {
 			# Select only those OIDs which should be updated
 			#
 			my @oids;
+			my $cur_time = DateTime->now();
 			foreach my $o (keys $host->{oids}) {
 				my $oid = $host->{oids}->{$o};
-				if (defined $oid->{next_update}) {
-					if ( DateTime->compare($oid->{next_update}, DateTime->now()) <= 0 ) {
-	                                        $host->{oids}->{$o}->{next_update}->add(seconds => $oid->{period});
-	                                        push @oids, $o;	
+				if (defined $oid->{last_update}) {
+					if ( DateTime->compare($oid->{last_update}, $cur_time->clone()->subtract(seconds => $oid->{period})) <= 0 ) {
+						push @oids, $o;	
+						$oid->{last_update}->add(seconds => $oid->{period});
 					}
 				} else {
-					$oid->{next_update} = DateTime->now()->add(seconds => $oid->{period});
+					$oid->{last_update} = $cur_time->clone();
 					push @oids, $o;
 				}
 			}
@@ -280,7 +281,7 @@ sub MAIN {
 					next;
 				}
 				foreach my $v (@$varlist) {
-					print $v->tag . '.' . $v->iid . '=' . $v->val, "\n"; 
+#					print $v->tag . '.' . $v->iid . '=' . $v->val, "\n"; 
 					$host->{oids}->{$v->tag . '.' . $v->iid}->{value} = $v->val;
 
 					my $file_name = $host->{oids}->{$v->tag . '.' . $v->iid}->{file};
@@ -304,15 +305,16 @@ sub RRD_update {
 		my @DS;
 		my @VAL;
 		while ( my ($d, $ds) = each $file->{rrd_datasources}) {
-			if (defined $ds->{value}) {
-				if (defined $ds->{convert}) {
-					printf "%s- Converting %s using %s...\n", ' 'x4, $ds->{value}, $ds->{convert};
-					if ( ref($CFG->{converters}->{$ds->{convert}}) eq 'CODE' ) {
-						$ds->{value} = &{$CFG->{converters}->{$ds->{convert}}}($ds->{value});
-					} else {
-						printf "%s! ERROR: Converter %s is not CODE reference!\n", ' 'x6, $ds->{convert}
-					}
+			if ( (defined $ds->{value}) && (defined $ds->{convert}) ) {
+				printf "%s- Converting %s using %s...\n", ' 'x4, $ds->{value}, $ds->{convert};
+				if ( ref($CFG->{converters}->{$ds->{convert}}) eq 'CODE' ) {
+					$ds->{value} = &{$CFG->{converters}->{$ds->{convert}}}($ds->{value});
+				} else {
+					printf "%s! ERROR: Converter %s is not CODE reference!\n", ' 'x6, $ds->{convert}
 				}
+			}
+
+			if (defined $ds->{value}) {
 				push @DS, $d;
 				push @VAL, $ds->{value};
 			} 
