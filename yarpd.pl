@@ -47,12 +47,27 @@ MAIN();
 #
 sub Prepare_Config {
 	my $cf = shift;
-	printf "* Entering %s...\n", (caller 0)[3];
+
+	#
+	# Check whether config is already loaded, or it's a brand new start
+	#
+	if (defined $CFG) {
+		syslog(LOG_DEBUG, "! Configuration file change detected. Reloading...");
+		# Close log file
+		closelog();
+		$CFG = undef;
+	}
+
 	#
 	# Include config
 	#
-	$CFG = undef if defined $CFG;
 	do "$cf" or die $!;
+
+	#
+	# Open logging
+	# TODO: Make facility configurable
+	openlog('yarpd', 'ndelay', LOG_DAEMON);
+	
 	#
 	# Update SNMP session data and indexes
 	#
@@ -135,6 +150,11 @@ sub _CFG_Update_SNMP {
 				SNMP_update_keys($h, $key) unless defined $h->{keys}->{$key};
 
 				# Convert information about datasource uri to host and exact oid
+
+				die "key: $key value: $value" unless defined $h->{keys}->{$key}->{$value};
+
+			
+
 				$mib_var .= '.' . $h->{keys}->{$key}->{$value};
 			}
 
@@ -142,7 +162,7 @@ sub _CFG_Update_SNMP {
 			my $rrd_ds_def = $CFG->{rrd_datasources}->{$d};
 			delete $file->{rrd_datasources}->{$d};
 			unless (defined $rrd_ds_def) {
-				printf "  ! ERROR: %s is not defined in rrd_data_sources!\n";
+				syslog(LOG_ERR, "  ! ERROR: %s is not defined in rrd_data_sources!", $rrd_ds_def);
 				next;
 			}
 
@@ -156,7 +176,7 @@ sub _CFG_Update_SNMP {
 				$ds->{$1}->{max}  = $4;
 				$ds->{$1}->{convert} = $converter;
 			} else {
-				printf "  ! ERROR: RRD Data Source definition %s is not supported!\n", $rrd_ds_def;
+				syslog(LOG_ERR, "  ! ERROR: RRD Data Source definition %s is not supported!", $rrd_ds_def);
 				next;
 			}
 		}
@@ -167,7 +187,7 @@ sub _CFG_Update_SNMP {
 # Function checks all RRD files and updates them if needed
 #
 sub _CFG_Update_RRD {
-	printf "* Entering %s...\n", (caller 0)[3];
+	syslog(LOG_DEBUG, "* Entering %s...\n", (caller 0)[3] );
 	
 	my $hosts = $CFG->{hosts};
 	foreach my $f (keys %{$CFG->{files}}) {
@@ -202,7 +222,7 @@ sub _CFG_Update_RRD {
 			RRDs::create($fn, (@DS, @{$file->{rrd_archives}}));
 			my $err = RRDs::error;
 			if ($err) {
-				printf "   * ERROR: %s\n", $err;
+				syslog(LOG_ERR, "   * RRD ERROR: %s", $err);
 			}
 			my $RRD = merge \@DS, $file->{rrd_archives};
 		}
@@ -226,7 +246,8 @@ sub _CFG_Update_RRD {
 # $CFG->{hosts}->{$host}->{keys}->{ifName}->{ethernet1/1} = index;
 sub SNMP_update_keys {
 	my $h 	= shift;		# reference to $CFG->{hosts}->{$host}
-	printf "* Entering %s for %s...\n", (caller 0)[3], $h->{snmp}->{hostname};
+
+	syslog(LOG_DEBUG, "* Entering %s for %s...", (caller 0)[3], $h->{snmp}->{hostname});
 	my $key = shift;
 	my $s 	= $h->{session}; 
 
@@ -236,111 +257,145 @@ sub SNMP_update_keys {
 	# Get the table of all keys-value
 	my $resp = ($s->bulkwalk(0, 8, $varlist))[0];
 	map { 
-		printf "%sSetting %s:%s to %s (Type: %s)\n", ' 'x2, $key, $_->val, $_->iid, $_->type;
+		syslog(LOG_DEBUG, "%sSetting %s:%s to %s (Type: %s)", ' 'x2, $key, $_->val, $_->iid, $_->type);
 		$h->{keys}->{$key}->{$_->val} = $_->iid;
 	} @$resp;
 }
 
 sub MAIN {
-	printf "* ENTERING MAIN LOOP\n";
+	syslog(LOG_DEBUG, "* ENTERING MAIN LOOP");
 	while(1) {
 		#
 		# Check configuration file changes
 		#
 		if ($CFGMON->scan()) {
-			print "! Configuration file change detected. Reloading...\n";
 			Prepare_Config($CF);
 		}
-		foreach my $h (keys %{$CFG->{hosts}}) {
-			my $host = $CFG->{hosts}->{$h};
-			#
-			# Select only those OIDs which should be updated
-			#
-			my @oids;
-			my $cur_time = DateTime->now();
-			foreach my $o (keys $host->{oids}) {
-				my $oid = $host->{oids}->{$o};
-				if (defined $oid->{last_update}) {
-					if ( DateTime->compare($oid->{last_update}, $cur_time->clone()->subtract(seconds => $oid->{period})) <= 0 ) {
-						push @oids, $o;	
-						$oid->{last_update}->add(seconds => $oid->{period});
-					}
-				} else {
-					$oid->{last_update} = $cur_time->clone();
-					push @oids, $o;
-				}
-			}
 
-			while (@oids) {
-				# Send 64 OIDs per one request. It should be enough for most devices
-				my $varlist = SNMP::VarList->new(map { [ $_ ] } splice @oids,0,64);
-				printf "* Sending SNMP request to %s...\n", $h;
-				my @res = $host->{session}->get($varlist);
-				if ( $host->{session}->{ErrorNum} ) {
-					printf "  ! ERROR: %s\n", $host->{session}->{ErrorStr};
+		#
+		# New approach. Run through the files but not through the hosts. Bigger num of SNMP requests but should be more smooth statistics
+		# Always sort files in order to prevent update time slipping!
+
+		my $ct = DateTime->now();
+
+		foreach my $f (sort { $a cmp $b } keys $CFG->{files} ) {
+			my $file = $CFG->{files}->{$f};
+
+                        my $cur_time = DateTime->now();
+
+			if (defined $file->{last_update}) {
+				if ( DateTime->compare($file->{last_update}, $cur_time->clone()->subtract(seconds => $file->{period})) <= 0 ) {
+					$file->{last_update}->add(seconds => $file->{period});
+				} else {
 					next;
 				}
-				foreach my $v (@$varlist) {
-#					print $v->tag . '.' . $v->iid . '=' . $v->val, "\n"; 
-					$host->{oids}->{$v->tag . '.' . $v->iid}->{value} = $v->val;
-
-					my $file_name = $host->{oids}->{$v->tag . '.' . $v->iid}->{file};
-					my $ds_name = $host->{oids}->{$v->tag . '.' . $v->iid}->{ds};
-					$CFG->{files}->{$file_name}->{rrd_datasources}->{$ds_name}->{value} = $v->val;
-				}
+			} else {
+				$file->{last_update} = $cur_time->clone();
 			}
+
+			Update_File($file);
 		}
-		RRD_update();
+
+		syslog(LOG_DEBUG, "TIME TAKEN to update all files: %s seconds", DateTime->now()->subtract_datetime_absolute($ct)->seconds());
+
 		sleep 5;
 	}
+	closelog();
+}
+
+sub Update_File {
+	my $file = shift;
+	syslog(LOG_DEBUG, "* Entering Update_file for %s...", $file->{apath});
+
+	my $data;
+
+	while (my ($d, $ds) = each $file->{rrd_datasources}) {
+		$data->{$ds->{host}}->{$ds->{oid}} = $d;
+	}
+
+	while (my ($hk, $hd) = each $data) {
+		my $host = $CFG->{hosts}->{$hk};
+		my @oids = (keys $hd);
+		while (@oids) {
+			# Send 64 OIDs per one request. It should be enough for most devices
+			my $varlist = SNMP::VarList->new(map { [ $_ ] } splice @oids,0,64);
+			syslog(LOG_DEBUG, "   - Sending SNMP request to %s...", $hk);
+			my @res = $host->{session}->get($varlist);
+			if ( $host->{session}->{ErrorNum} ) {
+				syslog(LOG_ERR, "  ! SNMP ERROR: %s", $host->{session}->{ErrorStr});
+				next;
+			}
+
+			foreach my $v (@$varlist) {
+#				print $v->tag . '.' . $v->iid . '=' . $v->val, "\n"; 
+				my $ds_name = $hd->{$v->tag . '.' . $v->iid};
+				$file->{rrd_datasources}->{$ds_name}->{value} = $v->val;
+			}
+		}
+	}
+	RRD_update($file);
+}
+
+sub _async_snmp {
+	my $host = shift;
+	my $vl = shift;
+
+	foreach my $v (@$vl) {
+#		print $v->tag . '.' . $v->iid . '=' . $v->val, "\n";
+		$host->{oids}->{$v->tag . '.' . $v->iid}->{value} = $v->val;
+	
+		my $file_name = $host->{oids}->{$v->tag . '.' . $v->iid}->{file};
+		my $ds_name = $host->{oids}->{$v->tag . '.' . $v->iid}->{ds};
+		$CFG->{files}->{$file_name}->{rrd_datasources}->{$ds_name}->{value} = $v->val;
+	}
+
+	SNMP::finish();
 }
 
 #
 # Update RRD files
 #
 sub RRD_update {
-	print "* Entering RRD Update...\n";
-	while (my ($f, $file) = each $CFG->{files} ) {
-		printf "%s- Updating %s...\n", ' 'x2, $file->{apath};
-		my @DS;
-		my @VAL;
-		while ( my ($d, $ds) = each $file->{rrd_datasources}) {
-			if ( (defined $ds->{value}) && (defined $ds->{convert}) ) {
-				printf "%s- Converting %s using %s...\n", ' 'x4, $ds->{value}, $ds->{convert};
-				if ( ref($CFG->{converters}->{$ds->{convert}}) eq 'CODE' ) {
-					$ds->{value} = &{$CFG->{converters}->{$ds->{convert}}}($ds->{value});
-				} else {
-					printf "%s! ERROR: Converter %s is not CODE reference!\n", ' 'x6, $ds->{convert}
-				}
+	my $file = shift;
+	syslog(LOG_DEBUG, "* Entering RRD Update for %s", $file->{apath});
+	my @DS;
+	my @VAL;
+	while ( my ($d, $ds) = each $file->{rrd_datasources}) {
+		if ( (defined $ds->{value}) && (defined $ds->{convert}) ) {
+			syslog(LOG_DEBUG, "%s- Converting %s using %s...", ' 'x4, $ds->{value}, $ds->{convert});
+			if ( ref($CFG->{converters}->{$ds->{convert}}) eq 'CODE' ) {
+				$ds->{value} = &{$CFG->{converters}->{$ds->{convert}}}($ds->{value});
+			} else {
+				syslog(LOG_ERR, "%s! ERROR: Converter %s is not CODE reference!", ' 'x6, $ds->{convert});
 			}
-
-			if (defined $ds->{value}) {
-				push @DS, $d;
-				push @VAL, $ds->{value};
-			} 
-			delete $ds->{value};
 		}
-		if ($#DS > -1) {
-			my @args;
 
-			my $template = join ':', @DS;
-			printf "%s- Template: %s\n", ' 'x4, $template;
-			push @args, '--template', $template;
+		if (defined $ds->{value}) {
+			push @DS, $d;
+			push @VAL, $ds->{value};
+		} 
+		delete $ds->{value};
+	}
+	if ($#DS > -1) {
+		my @args;
 
-			my $values = 'N:' . join ':', @VAL;
-			printf "%s- Values: %s\n", ' 'x4, $values;
-			push @args, $values;
-			printf "%s- RRD code: rrdtool update %s %s\n", ' 'x4, $file->{apath}, join(' ', @args);
+		my $template = join ':', @DS;
+		syslog(LOG_DEBUG, "%s- Template: %s", ' 'x4, $template);
+		push @args, '--template', $template;
 
-			RRDs::update($file->{apath}, @args);
+		my $values = 'N:' . join ':', @VAL;
+		syslog(LOG_DEBUG, "%s- Values: %s", ' 'x4, $values);
+		push @args, $values;
+		syslog(LOG_DEBUG, "%s- [%s] RRD code: rrdtool update %s %s", ' 'x4, DateTime->now(), $file->{apath}, join(' ', @args));
 
-			my $err = RRDs::error;
-			if ($err) {
-				printf "%s! ERROR: %s\n", ' 'x4, $err;
-			}
-		} else {
-			printf "%s! No data for updating.\n", ' 'x4;
+		RRDs::update($file->{apath}, @args);
+
+		my $err = RRDs::error;
+		if ($err) {
+			syslog(LOG_ERR, "%s! ERROR: %s", ' 'x4, $err);
 		}
+	} else {
+		syslog(LOG_DEBUG, "%s! No data for updating.", ' 'x4);
 	}
 }
 
@@ -350,7 +405,7 @@ sub _rrd_add_ds {
 
 	return unless scalar @$new_ds;
 
-	printf "%s- Adding new datasources (%s) to file %s...\n", ' 'x2, join (', ', @$new_ds), $file->{apath};
+	syslog(LOG_NOTICE, "%s- Adding new datasources (%s) to file %s...", ' 'x2, join (', ', @$new_ds), $file->{apath});
 
 	my @DS;
 	foreach my $ds_name (@$new_ds) {
@@ -360,7 +415,7 @@ sub _rrd_add_ds {
 	RRDs::tune($file->{apath}, @DS);
 	my $err = RRDs::error;
 	if ($err) {
-		printf "%s! ERROR: %s\n", ' 'x4, $err;
+		syslog(LOG_ERR, "%s! ERROR: %s", ' 'x4, $err);
 	}
 }
 
