@@ -67,156 +67,182 @@ sub Prepare_Config {
 	# Open logging
 	# TODO: Make facility configurable
 	openlog('yarpd', 'ndelay', LOG_DAEMON);
-	
+
 	#
-	# Update SNMP session data and indexes
+	# Process templates hierarchy
 	#
-	_CFG_Update_SNMP();
+	_CFG_Process_Templates();
+
 	#
 	# Update RRD files properly
 	#
-	_CFG_Update_RRD();
+	_CFG_Process_Files();
+
+	#
+	# Process data gathering methods defined in 'source' field of each datasource
+	#
+	_CFG_Process_Sources();
+
+	#
+	# Process SNMP host keys, indexes etc.
+	#
+	_CFG_Process_SNMP();
+
 }
 
-#
-# Function updates SNMP session data, indexes etc.
-#
-sub _CFG_Update_SNMP {
-	while (my ($f, $file) = each $CFG->{files}) {
-		#
-		# Include template, if required
-		#
-		if (defined $file->{template}) {
-			next unless defined $CFG->{templates}->{$file->{template}};
-			# Clone template data
-			my $tf = dclone($CFG->{templates}->{$file->{template}});
-			# Replace variables with values
-			rmap { s/%%([\w\d\-_]+)%%/$file->{var}->{$1}/g; $_; } $tf;
-			$file = $CFG->{files}->{$f} = merge ($file, $tf);
-		}
+sub _CFG_Process_Templates {
+	syslog(LOG_NOTICE, "* Re-building templates...");
 
-		#
-		# Parse sources of data in files definition
-		#
-		foreach my $d (keys %{$file->{rrd_datasources}}) {
-			# Datasource definition if file can be either scalar ot hash reference. The second option is intended for converting values returned by SNMP
-			my $url_string;
-			my $converter;
-			if ( ref($file->{rrd_datasources}->{$d}) eq 'HASH' ) {
-				$url_string = $file->{rrd_datasources}->{$d}->{url};
-				$converter  = $file->{rrd_datasources}->{$d}->{convert};
-			} else {
-				$url_string = $file->{rrd_datasources}->{$d};
+	while (my ($t, $template) = each $CFG->{templates}) {
+		if (defined $template->{inherit}) {
+			my @in_templates = @{$template->{inherit}};
+			delete $template->{inherit};
+
+			foreach my $ti (@in_templates) {
+				if (defined $CFG->{templates}->{$ti}) {
+					syslog(LOG_ERR, "  Inheriting template %s into %s...", $ti, $t);
+					# Clone template
+					my $tc = dclone($CFG->{templates}->{$ti});
+
+					# Replace variables with values
+					rmap { 
+						my $line = $_; 
+						while (/%%([\w\d\-_]+)%%/g) {
+							my $v = $1;
+							if (defined $template->{var}->{$v}) {
+								$line =~ s/%%$v%%/$template->{var}->{$v}/e;
+							} 
+						}
+						$_ = $line;
+					} $tc;
+
+					# Merge
+					$template = $CFG->{templates}->{$t} = merge ($template, $tc);
+				} else {
+					syslog(LOG_ERR, "  Unable to inherit template %s into %s. %s is not configured!", $ti, $t, $ti);
+					next;
+				}
 			}
-
-			# Create new URI object
-			my $url = URI->new($url_string);
-
-			# Get information about scheme
-			next unless $url->scheme eq 'snmp2c';
-
-			# Create sessions for all hosts found in URIs
-			# Skip if it was already created
-			my $host;
-			if ($url->authority =~ /^([\w\-]+)\@([\w\-]+)(:(\d+))?/) {
-			   $host = $2;
-			   unless (defined $CFG->{hosts}->{$host}) {
-			      my $h = $CFG->{hosts}->{$host} = {};
-			      # Store host data (not used now, may be removed in future)
-			      $h->{snmp}->{hostname}	= $host;
-			      $h->{snmp}->{port}	= $4 ? $4 : 161;
-			      $h->{snmp}->{community}	= $1;
-			      $h->{snmp}->{version} 	= 2;
-			      # Store session
-			      $CFG->{hosts}->{$host}->{session} = SNMP::Session->new(
-						DestHost	=> $2 . ':' . $h->{snmp}->{port},
-						Version		=> 2,
-						Community	=> $1,
-						UseNumeric      => 0,
-						UseLongNames	=> 0,
-						BestGuess	=> 2		# This is needed to translation MIB Var -> OID
-			      );
-			   }
-			} else {
-			   next;
-			}
-			my $h = $CFG->{hosts}->{$host};
-
-			# Save information about all keys
-			my ($key, $value) = ($url->query_form)[0,1];
-			my $mib_var = substr($url->path, 1);
-			if (defined $key) {
-				# Update keys if they wasn't updated yet
-				SNMP_update_keys($h, $key) unless defined $h->{keys}->{$key};
-
-				# Convert information about datasource uri to host and exact oid
-
-				die "key: $key value: $value" unless defined $h->{keys}->{$key}->{$value};
-
-			
-
-				$mib_var .= '.' . $h->{keys}->{$key}->{$value};
-			}
-
-			# --- replace DS definition in URL form with hash reference
-			my $rrd_ds_def = $CFG->{rrd_datasources}->{$d};
-			delete $file->{rrd_datasources}->{$d};
-			unless (defined $rrd_ds_def) {
-				syslog(LOG_ERR, "  ! ERROR: %s is not defined in rrd_data_sources!", $rrd_ds_def);
-				next;
-			}
-
-			my $ds = $file->{rrd_datasources};
-
-			if ($rrd_ds_def =~ /^(\w+):(COUNTER|GAUGE):(\-?\d+):(\-?(\d+|U))$/) {
-				$ds->{$1}->{host} = $h->{snmp}->{hostname};
-				$ds->{$1}->{oid}  = $mib_var;
-				$ds->{$1}->{type} = $2;
-				$ds->{$1}->{min}  = $3;
-				$ds->{$1}->{max}  = $4;
-				$ds->{$1}->{convert} = $converter;
-			} else {
-				syslog(LOG_ERR, "  ! ERROR: RRD Data Source definition %s is not supported!", $rrd_ds_def);
-				next;
-			}
+			redo;
+		} else {
+			next;
 		}
 	}
 }
 
 #
-# Function checks all RRD files and updates them if needed
+# Function re-arranges RRD files
 #
-sub _CFG_Update_RRD {
-	syslog(LOG_DEBUG, "* Entering %s...\n", (caller 0)[3] );
-	
-	my $hosts = $CFG->{hosts};
-	foreach my $f (keys %{$CFG->{files}}) {
-		my $file = $CFG->{files}->{$f};
+sub _CFG_Process_Files {
+	syslog(LOG_NOTICE, "* Re-building RRD files...");
+	while (my ($f, $file) = each $CFG->{files}) {
+		#
+		# Include template, if required
+		#
+		if (defined $file->{template}) {
+			my @in_templates;
+			if (ref $file->{template}) {
+				if (ref $file->{template} eq 'ARRAY') {
+					@in_templates = @{$file->{template}};
+				} else {
+					syslog (LOG_ERR, "  Template for file %s is not an array reference or scalar. Skip this file", $f);
+					delete $CFG->{files}->{$f};
+					next;
+				}
+			} else {
+				push @in_templates, $file->{template};
+			}
+			delete $file->{template};
 
-		#
-		# Check whether file exists
-		#
+			foreach my $ti (@in_templates) {
+				if (defined $CFG->{templates}->{$ti}) {
+					syslog(LOG_DEBUG, "  Using template %s for file %s...", $ti, $f);
+					# Clone template data
+					my $tc = dclone($CFG->{templates}->{$ti});
+
+                                        # Replace variables with values
+                                        rmap {
+                                                my $line = $_;
+                                                while (/%%([\w\d\-_]+)%%/g) {
+                                                        my $v = $1;
+                                                        if (defined $file->{var}->{$v}) {
+                                                                $line =~ s/%%$v%%/$file->{var}->{$v}/e;
+                                                        }
+                                                }
+                                                $_ = $line;
+                                        } $tc;
+
+                                        # Merge
+                                        $file = $CFG->{files}->{$f} = merge ($file, $tc);
+				} else {
+					syslog(LOG_ERR, "  Unable to use template %s for file %s. Template %s is not configured!", $file->{template}, $f, $file->{template});
+                                        delete $CFG->{files}->{$f};
+					next;
+				}
+			}
+		} # End of template processing
+
+		# Get the absolute path for the file ...
 		my $fn = $f =~ /^\// ? $f : $CFG->{paths}->{rrd} . '/' . $f;
-
-		$file->{apath} = $fn;	# Store absolute path for the future
+		$file->{apath} = $fn;	# ... and store it for the future use
 
 		if (-f $fn) {
+			syslog(LOG_DEBUG, "  Checking file %s...", $fn);
 			my $ri = RRDs::info $fn;
+			my @RRD;
+
 			map { 
 			   $ri->{ds}->{$1}->{$2} = $ri->{$_} if $_ =~ /^ds\[([\w\d]+)\]\.(type|min|max|.minimal_heartbeat)$/;
 			} keys %$ri;
 
-			# Compare datasources from configuration with ones from file
+			# Compare datasources from current RRD file against configured 
 			my $rc = List::Compare->new([keys $ri->{ds}], [keys $file->{rrd_datasources}]);
 
-			# Add new datasources to file if they appear in configuration
-			_rrd_add_ds($file, $rc->get_Ronly_ref);
+			# If there is new datasources in configuration then add them to a file
+			foreach my $ds ($rc->get_Ronly) {
+				syslog(LOG_DEBUG, "%s- Adding new datasource %s...", ' 'x4, $ds);
+				my $ds = $file->{rrd_datasources}->{$ds};
+				push @RRD, sprintf("DS:%s:%s:%s:%s:%s", $ds, $ds->{type}, 2*$file->{period}, $ds->{min}, $ds->{max} );
+			}
+
+			# DO NOT remove datasources from file if they are not configured.
+			# Just remove them from future processing
+                        foreach my $ds ($rc->get_Lonly) {
+				delete $ri->{ds}->{$ds};
+			}
+
+			# Check MAX values for each datasource
+			foreach my $ds (keys $ri->{ds}) {
+				if (defined $ri->{ds}->{$ds}->{max} && $file->{rrd_datasources}->{$ds}->{max} ne 'U') {
+					# Case 1: Both MAX values are defined. Compare them
+					if ($ri->{ds}->{$ds}->{max} ne $file->{rrd_datasources}->{$ds}->{max}) {
+						push @RRD, '--maximum', $ds . ':' . $file->{rrd_datasources}->{$ds}->{max};
+						syslog(LOG_DEBUG, "%s- Changing datasource %s MAX value %s -> %s...", ' 'x4, $ds, $ri->{ds}->{$ds}->{max}, $file->{rrd_datasources}->{$ds}->{max});
+					} 
+				} elsif (defined $ri->{ds}->{$ds}->{max}) {
+					# Case 2: MAX value is defined in file but not defined in configuration
+					push @RRD, '--maximum', $ds . ':U';
+					syslog(LOG_DEBUG, "%s- Changing datasource %s MAX value %s -> U...", ' 'x4, $ds, $ri->{ds}->{$ds}->{max});
+				} elsif ($file->{rrd_datasources}->{$ds}->{max} ne 'U') {
+					# Case 3: MAX value is not defined in file but defined in configuration
+					push @RRD, '--maximum', $ds . ':' . $file->{rrd_datasources}->{$ds}->{max};
+					syslog(LOG_DEBUG, "%s- Changing datasource %s MAX value U -> %s...", ' 'x4, $ds, $file->{rrd_datasources}->{$ds}->{max});
+				} 
+			}
+
+			RRDs::tune($file->{apath}, @RRD);
+			my $err = RRDs::error;
+			if ($err) {
+				syslog(LOG_ERR, "%s! ERROR: %s", ' 'x4, $err);
+			}
+
 		} else {
+			syslog(LOG_DEBUG, "  Creating file %s...", $fn);
 			my @DS;
 			push @DS, '--step', $file->{period};
 
 			while (my ($d, $ds) =  each $file->{rrd_datasources}) {
-				push @DS, sprintf("DS:%s:%s:%s:%s:%s", $d, $ds->{type}, 2*$file->{period}, $ds->{min}, $ds->{max} );
+				push @DS, sprintf("DS:%s:%s:%s:%s:%s", $d, $ds->{type}, 2*$file->{period}, $ds->{min} || 'U', $ds->{max} || 'U' );
 			}
 
 			RRDs::create($fn, (@DS, @{$file->{rrd_archives}}));
@@ -224,42 +250,82 @@ sub _CFG_Update_RRD {
 			if ($err) {
 				syslog(LOG_ERR, "   * RRD ERROR: %s", $err);
 			}
-			my $RRD = merge \@DS, $file->{rrd_archives};
 		}
+	}
+}
 
-		#
-		# Form a hash for SNMP requests:
-		# host->{oids}->{oid}->{file} = file to save in
-		# host->{oids}->{oid}->{ds} = data source to use
-		# host->{oids}->{oid}->{period} = period
+sub _CFG_Process_Sources {
+	syslog(LOG_NOTICE, "* Re-building data gathering methods...");
+        while (my ($f, $file) = each $CFG->{files}) {
                 while (my ($d, $ds) = each $file->{rrd_datasources}) {
-			$hosts->{$ds->{host}}->{oids}->{$ds->{oid}}->{file} = $f;
-			$hosts->{$ds->{host}}->{oids}->{$ds->{oid}}->{ds}   = $d;
-			$hosts->{$ds->{host}}->{oids}->{$ds->{oid}}->{period} = $file->{period};
-                }
+			syslog (LOG_DEBUG, "  file: %s, DS: %s", $f, $d);
+
+			# Create new URI object
+			my $url = URI->new($ds->{source});
+
+                        # Get information about scheme
+			# Only snmp2c is currently supported
+                        if ($url->scheme eq 'snmp2c') {
+				# 'snmp2c' is a network method. Parse URL and store community/host/port data
+				if ($url->authority =~ /^([\w\-]+)\@([\w\-]+)(:(\d+))?/) {
+					my $h = $2;
+					my $host = $CFG->{hosts}->{$h};
+					unless ( defined $host ) {
+						$host = $CFG->{hosts}->{$h} = {};
+						$CFG->{hosts}->{$h}->{session} = SNMP::Session->new(
+                                                	DestHost        => $h . ':' . ($4 || '161'),
+                                                	Version         => 2,
+                                                	Community       => $1,
+                                                	UseNumeric      => 0,
+                                                	UseLongNames    => 0,
+                                                	BestGuess       => 2            # This is needed to translation MIB Var -> OID
+                              			);
+					} 
+
+					my ($key, $value) = ($url->query_form)[0,1];
+
+		                        $host->{keys}->{$key} = {};
+
+	        	                $ds->{_data} = {
+						method  => 'snmp',
+                        	       	        host    => $h,
+                                        	key     => $key,
+	                                        val     => $value,
+						mib_var => substr($url->path, 1)
+        		                };
+				} else {
+					syslog(LOG_ERR, "    Invalid URL %s. Ignoring.", $ds->{source});
+					delete $file->{rrd_datasources}->{$d};
+					next;
+				}
+                        } else {
+				syslog(LOG_ERR, "    scheme %s is not supported. Ignoring.", $url->scheme);
+				delete $file->{rrd_datasources}->{$d};
+				next;
+			}
+		}
 	}
 }
 
 #
-# Function takes host and key (i.e. lsr-1gdr, ifName) as arguments
-# and updates keys list for host as hashref: 
+# Function updates keys list for host as hashref: 
 # $CFG->{hosts}->{$host}->{keys}->{ifName}->{ethernet1/1} = index;
-sub SNMP_update_keys {
-	my $h 	= shift;		# reference to $CFG->{hosts}->{$host}
+sub _CFG_Process_SNMP {
+	syslog(LOG_NOTICE, "* Updating SNMP indexes...");
 
-	syslog(LOG_DEBUG, "* Entering %s for %s...", (caller 0)[3], $h->{snmp}->{hostname});
-	my $key = shift;
-	my $s 	= $h->{session}; 
+	while ( my ($h, $host) = each $CFG->{hosts} ) {
+		syslog(LOG_DEBUG, "  ... for host %s ...", $h);
 
-	# Convert $key from MIB variable to OID
-	my $oid	= $key;
-	my $varlist = SNMP::VarList->new([ $oid ]);
-	# Get the table of all keys-value
-	my $resp = ($s->bulkwalk(0, 8, $varlist))[0];
-	map { 
-		syslog(LOG_DEBUG, "%sSetting %s:%s to %s (Type: %s)", ' 'x2, $key, $_->val, $_->iid, $_->type);
-		$h->{keys}->{$key}->{$_->val} = $_->iid;
-	} @$resp;
+		my $varlist = SNMP::VarList->new( [ keys $host->{keys} ] );
+
+	        # Get the table of all keys-value
+		my $resp = ($host->{session}->bulkwalk(0, 8, $varlist))[0];
+
+		map {
+#			syslog(LOG_DEBUG, "    Setting %s:%s to %s (Type: %s)", $_->tag, $_->val, $_->iid, $_->type);
+			$host->{keys}->{$_->tag}->{$_->val} = $_->iid;
+		} @$resp;
+	}
 }
 
 sub MAIN {
@@ -288,7 +354,7 @@ sub MAIN {
 					$file->{last_update}->add(seconds => $file->{period});
 				} else {
 					next;
-				}
+ 				}
 			} else {
 				$file->{last_update} = $cur_time->clone();
 			}
@@ -305,13 +371,29 @@ sub MAIN {
 
 sub Update_File {
 	my $file = shift;
-	syslog(LOG_DEBUG, "* Entering Update_file for %s...", $file->{apath});
+	syslog(LOG_DEBUG, "  -- Updating file %s...", $file->{apath});
 
 	my $data;
 
+	#
+	# Gather all SNMP data sources
+	#
 	while (my ($d, $ds) = each $file->{rrd_datasources}) {
-		$data->{$ds->{host}}->{$ds->{oid}} = $d;
+		my $ds_data = $ds->{_data};
+		if ($ds->{_data}->{method} eq 'snmp') {
+			my $host = $CFG->{hosts}->{$ds_data->{host}};
+			my $idx = $host->{keys}->{$ds_data->{key}}->{$ds_data->{val}};
+
+			if (defined $idx) {
+				my $oid = $ds_data->{mib_var} . '.' . $idx;
+				$data->{$ds_data->{host}}->{$oid} = $d;
+			} else {
+				syslog(LOG_ERR, "    Unable to find index for key %s for datasource %s!", $ds_data->{key}, $d);
+			}
+		}
 	}
+
+	return unless defined $data;
 
 	while (my ($hk, $hd) = each $data) {
 		my $host = $CFG->{hosts}->{$hk};
@@ -396,26 +478,6 @@ sub RRD_update {
 		}
 	} else {
 		syslog(LOG_DEBUG, "%s! No data for updating.", ' 'x4);
-	}
-}
-
-sub _rrd_add_ds {
-	my $file   = shift;	# reference to file hash from configuration
-	my $new_ds = shift;	# reference to list of datasource names to be added
-
-	return unless scalar @$new_ds;
-
-	syslog(LOG_NOTICE, "%s- Adding new datasources (%s) to file %s...", ' 'x2, join (', ', @$new_ds), $file->{apath});
-
-	my @DS;
-	foreach my $ds_name (@$new_ds) {
-		my $ds = $file->{rrd_datasources}->{$ds_name};
-		push @DS, sprintf("DS:%s:%s:%s:%s:%s", $ds_name, $ds->{type}, 2*$file->{period}, $ds->{min}, $ds->{max} );
-        }
-	RRDs::tune($file->{apath}, @DS);
-	my $err = RRDs::error;
-	if ($err) {
-		syslog(LOG_ERR, "%s! ERROR: %s", ' 'x4, $err);
 	}
 }
 
